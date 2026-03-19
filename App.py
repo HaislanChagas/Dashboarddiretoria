@@ -11,15 +11,26 @@ from google.oauth2.service_account import Credentials
 st.set_page_config(page_title="Dashboard Executivo do Diretor", page_icon="📊", layout="wide")
 px.defaults.template = "plotly_dark"
 
+# =========================
+# CONFIG
+# =========================
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1mC29Jya_c5KTVZpHqfRSDLkuVWv4_ASYNISEPQzN2xQ/edit#gid=0"
 SHEET_INDICADORES = "1WEA9Mhc8kPj8LdN8h_eB264nLlcI4fZY0lDMjrEsn60"
 ABA_BASE_DASHBOARD = "BASE_DASHBOARD"
+
+# COLE AQUI O ID DA PLANILHA GOOGLE SHEETS DA ROLETA
+# Exemplo: "1AbCDefGhIJklmnOPqRstUVwxYZ1234567890"
+SHEET_ROLETA = "15HV7fUtCJ4AN5kG81fgJjLVf29wLsHQsrQ5H1m0Vq7U"
+ABA_ROLETA = "ROLETA"
 
 CACHE_TTL = 300
 ABAS_EXCLUIDAS_RANKING = {"Funil de Vendas Geral"}
 ETAPAS = ["Leads", "Pasta", "Aprovação", "Proposta", "Venda"]
 
 
+# =========================
+# CSS
+# =========================
 def load_css():
     with open("style.css", encoding="utf-8") as f:
         st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
@@ -28,6 +39,9 @@ def load_css():
 load_css()
 
 
+# =========================
+# HELPERS
+# =========================
 def normalizar_texto(texto) -> str:
     if texto is None:
         return ""
@@ -122,6 +136,9 @@ def estilizar_fig(fig):
     return fig
 
 
+# =========================
+# GOOGLE SHEETS
+# =========================
 @st.cache_resource
 def conectar_google():
     creds = Credentials.from_service_account_info(
@@ -153,6 +170,9 @@ def carregar_aba_raw(nome_aba: str):
     return ws.get_all_values()
 
 
+# =========================
+# PARSER FUNIL
+# =========================
 def detectar_coluna_ancora(valores):
     max_cols = max(len(l) for l in valores) if valores else 0
     for c in range(max_cols):
@@ -249,6 +269,9 @@ def carregar_dados_dashboard():
     return pd.DataFrame(resumos), (pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()), erros
 
 
+# =========================
+# INDICADORES - BASE_DASHBOARD
+# =========================
 @st.cache_data(ttl=CACHE_TTL)
 def carregar_indicadores():
     try:
@@ -349,7 +372,7 @@ def carregar_indicadores():
         df["Equipe"] = df["Equipe"].astype(str).str.strip()
 
         df = df[(df["Mes"] != "") & (df["Equipe"] != "")].copy()
-        df = df[(df["Vendas"] > 0) | (df["VGV"] > 0)].copy()
+        df = df[(df["Vendas"] > 0) | (df["VGV"] > 0) | (df.get("Roleta", 0) > 0)].copy()
 
         df["Ticket_Medio"] = df.apply(lambda x: safe_div(x["VGV"], x["Vendas"]), axis=1)
 
@@ -377,6 +400,102 @@ def carregar_indicadores():
         return pd.DataFrame(), f"{type(e).__name__}: {e}"
 
 
+# =========================
+# ROLETA DIÁRIA
+# =========================
+@st.cache_data(ttl=CACHE_TTL)
+def carregar_roleta_diaria():
+    try:
+        if not SHEET_ROLETA or SHEET_ROLETA == "COLE_AQUI_O_ID_DA_PLANILHA_ROLETA":
+            return pd.DataFrame(), "Configure o ID da planilha da roleta em SHEET_ROLETA."
+
+        gc = conectar_google()
+        sh = gc.open_by_key(SHEET_ROLETA)
+        ws = sh.worksheet(ABA_ROLETA)
+
+        valores = ws.get_all_values()
+        if not valores or len(valores) < 3:
+            return pd.DataFrame(), "A aba ROLETA está vazia ou sem dados suficientes."
+
+        # No arquivo exemplo, o cabeçalho real estava na 2ª linha (índice 1)
+        # Aqui tentamos detectar automaticamente entre as primeiras linhas.
+        header_idx = None
+        for i, linha in enumerate(valores[:10]):
+            linha_norm = [normalizar_texto(c) for c in linha]
+            texto_linha = " | ".join(linha_norm)
+            if "data" in texto_linha and ("total" in texto_linha or "roleta" in texto_linha):
+                header_idx = i
+                break
+
+        if header_idx is None:
+            return pd.DataFrame(), f"Não encontrei o cabeçalho da aba ROLETA. Primeiras linhas: {valores[:5]}"
+
+        header = [str(x).strip() for x in valores[header_idx]]
+        linhas = valores[header_idx + 1:]
+
+        linhas = [linha for linha in linhas if any(str(c).strip() != "" for c in linha)]
+        if not linhas:
+            return pd.DataFrame(), "Não há linhas de dados na aba ROLETA."
+
+        max_cols = len(header)
+        linhas_pad = []
+        for linha in linhas:
+            if len(linha) < max_cols:
+                linha = linha + [""] * (max_cols - len(linha))
+            else:
+                linha = linha[:max_cols]
+            linhas_pad.append(linha)
+
+        df = pd.DataFrame(linhas_pad, columns=header)
+        mapa = {normalizar_texto(c): c for c in df.columns}
+
+        col_data = mapa.get("data")
+        col_manha = mapa.get("roleta manha") or mapa.get("roleta manhã")
+        col_total = mapa.get("total")
+        col_noite = mapa.get("roleta noite")
+        col_rn_total = mapa.get("r.n total") or mapa.get("rn total")
+
+        if not col_data or not col_total:
+            return pd.DataFrame(), f"Colunas encontradas na roleta: {list(df.columns)}"
+
+        cols = [col_data, col_total]
+        if col_manha:
+            cols.append(col_manha)
+        if col_noite:
+            cols.append(col_noite)
+        if col_rn_total:
+            cols.append(col_rn_total)
+
+        df = df[cols].copy()
+
+        rename_map = {
+            col_data: "Dia",
+            col_total: "Roleta_Total",
+        }
+        if col_manha:
+            rename_map[col_manha] = "Roleta_Manha"
+        if col_noite:
+            rename_map[col_noite] = "Roleta_Noite"
+        if col_rn_total:
+            rename_map[col_rn_total] = "RN_Total"
+
+        df = df.rename(columns=rename_map)
+
+        for col in df.columns:
+            if col != "Dia":
+                df[col] = df[col].apply(numero)
+
+        df["Dia"] = df["Dia"].apply(numero)
+        df = df[df["Dia"] > 0].copy()
+        df["Dia"] = df["Dia"].astype(int)
+        df = df.sort_values("Dia").reset_index(drop=True)
+
+        return df, None
+
+    except Exception as e:
+        return pd.DataFrame(), f"{type(e).__name__}: {e}"
+
+
 def valor_etapa(df, etapa, coluna):
     temp = df[df["etapa"] == etapa]
     if temp.empty:
@@ -384,6 +503,9 @@ def valor_etapa(df, etapa, coluna):
     return numero(temp.iloc[0][coluna])
 
 
+# =========================
+# RENDER - PERFORMANCE FINANCEIRA
+# =========================
 def render_financeiro():
     df_indicadores, erro_ind = carregar_indicadores()
 
@@ -561,12 +683,12 @@ def render_financeiro():
             unsafe_allow_html=True,
         )
 
-    tabela_cols = ["Mes", "Vendas", "VGV", "Ticket_Medio"]
+    tabela_cols = ["Mes", "Equipe", "Vendas", "VGV", "Ticket_Medio"]
     for extra in ["Conversao", "Corretor_Ativo", "Roleta", "IPC", "Equipe_Produtiva", "Quarentena"]:
         if extra in df_indicadores.columns:
             tabela_cols.append(extra)
 
-    tabela_fin = df_indicadores[tabela_cols + ["Equipe"]].copy()
+    tabela_fin = df_indicadores[tabela_cols].copy()
     tabela_fin = tabela_fin.rename(columns={
         "Mes": "Mês",
         "Equipe": "Equipe",
@@ -583,6 +705,150 @@ def render_financeiro():
     st.dataframe(tabela_fin, use_container_width=True, height=300)
 
 
+# =========================
+# RENDER - ROLETA
+# =========================
+def render_roleta():
+    df_roleta, erro_roleta = carregar_roleta_diaria()
+    df_indicadores, erro_ind = carregar_indicadores()
+
+    if erro_roleta:
+        st.warning(f"Roleta diária: {erro_roleta}")
+    if erro_ind:
+        st.warning(f"Indicadores: {erro_ind}")
+
+    if df_roleta.empty:
+        st.warning("Sem dados da roleta diária.")
+        return
+
+    roleta_total_mes = numero(df_roleta["Roleta_Total"].sum())
+    roleta_manha = numero(df_roleta["Roleta_Manha"].sum()) if "Roleta_Manha" in df_roleta.columns else 0
+    roleta_noite = numero(df_roleta["Roleta_Noite"].sum()) if "Roleta_Noite" in df_roleta.columns else 0
+    rn_total = numero(df_roleta["RN_Total"].sum()) if "RN_Total" in df_roleta.columns else 0
+
+    vendas_mes = 0
+    vgv_mes = 0
+    conv_roleta = 0
+    vgv_por_roleta = 0
+
+    if not df_indicadores.empty:
+        consolidado_mes = (
+            df_indicadores.groupby(["Mes", "ordem_mes"], as_index=False)
+            .agg({"Vendas": "sum", "VGV": "sum"})
+            .sort_values("ordem_mes")
+            .reset_index(drop=True)
+        )
+
+        if not consolidado_mes.empty:
+            ultimo = consolidado_mes.iloc[-1]
+            vendas_mes = numero(ultimo["Vendas"])
+            vgv_mes = numero(ultimo["VGV"])
+            conv_roleta = safe_div(vendas_mes, roleta_total_mes)
+            vgv_por_roleta = safe_div(vgv_mes, roleta_total_mes)
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        card_kpi("Roleta total mês", fmt_int(roleta_total_mes), "Total acumulado")
+    with c2:
+        card_kpi("Roleta manhã", fmt_int(roleta_manha), "Volume manhã")
+    with c3:
+        card_kpi("Roleta noite", fmt_int(roleta_noite), "Volume noite")
+    with c4:
+        card_kpi("RN total", fmt_int(rn_total), "Retorno / RN acumulado")
+
+    c5, c6, c7, c8 = st.columns(4)
+    with c5:
+        card_kpi("Vendas do mês", fmt_int(vendas_mes), "Base financeira")
+    with c6:
+        card_kpi("Conversão da roleta", fmt_pct(conv_roleta), "Vendas / roleta")
+    with c7:
+        card_kpi("VGV do mês", fmt_money(vgv_mes, 0), "Base financeira")
+    with c8:
+        card_kpi("VGV por roleta", fmt_money(vgv_por_roleta, 0), "VGV / roleta")
+
+    g1, g2 = st.columns(2)
+
+    with g1:
+        fig_roleta_total = px.line(
+            df_roleta,
+            x="Dia",
+            y="Roleta_Total",
+            markers=True,
+            title="Evolução diária da roleta total",
+        )
+        fig_roleta_total.update_traces(line_color="#4dd099", marker_color="#4dd099")
+        st.plotly_chart(estilizar_fig(fig_roleta_total), use_container_width=True)
+
+    with g2:
+        cols_plot = []
+        if "Roleta_Manha" in df_roleta.columns:
+            cols_plot.append("Roleta_Manha")
+        if "Roleta_Noite" in df_roleta.columns:
+            cols_plot.append("Roleta_Noite")
+
+        if cols_plot:
+            fig_turnos = px.bar(
+                df_roleta,
+                x="Dia",
+                y=cols_plot,
+                barmode="group",
+                title="Roleta por turno",
+            )
+            st.plotly_chart(estilizar_fig(fig_turnos), use_container_width=True)
+
+    if "RN_Total" in df_roleta.columns:
+        fig_rn = px.line(
+            df_roleta,
+            x="Dia",
+            y="RN_Total",
+            markers=True,
+            title="Evolução diária do RN total",
+        )
+        fig_rn.update_traces(line_color="#60a5fa", marker_color="#60a5fa")
+        st.plotly_chart(estilizar_fig(fig_rn), use_container_width=True)
+
+    st.markdown("<div class='section-title'>Leitura executiva da roleta</div>", unsafe_allow_html=True)
+
+    if conv_roleta < 0.03:
+        st.markdown(
+            f"""
+            <div class="alert-bad">
+                <b>Alerta:</b> baixa conversão da roleta no mês.<br>
+                Roleta total: {fmt_int(roleta_total_mes)} |
+                Vendas: {fmt_int(vendas_mes)} |
+                Conversão: {fmt_pct(conv_roleta)}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    elif conv_roleta >= 0.03 and conv_roleta < 0.06:
+        st.markdown(
+            """
+            <div class="alert-warn">
+                <b>Status:</b> conversão da roleta em nível intermediário.<br>
+                Há espaço para melhorar abordagem, qualificação e fechamento.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f"""
+            <div class="alert-good">
+                <b>Destaque:</b> a roleta está sendo bem aproveitada.<br>
+                Conversão atual: {fmt_pct(conv_roleta)} |
+                VGV por roleta: {fmt_money(vgv_por_roleta, 0)}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.dataframe(df_roleta, use_container_width=True, height=320)
+
+
+# =========================
+# HEADER
+# =========================
 st.markdown(
     """
     <div class="brand-box">
@@ -605,6 +871,10 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
+
+# =========================
+# CARGA PRINCIPAL
+# =========================
 df_resumo, df_funil, erros = carregar_dados_dashboard()
 
 if erros:
@@ -625,6 +895,10 @@ with st.sidebar:
 
 df_ops_filtrado = df_ops[df_ops["aba"] == operacao_filtro].copy() if operacao_filtro != "Todas" else df_ops.copy()
 
+
+# =========================
+# KPIS TOPO
+# =========================
 mes_nome = df_funil["mes_nome"].dropna().iloc[0] if not df_funil["mes_nome"].dropna().empty else "-"
 dias_mes = numero(df_funil["dias_mes"].dropna().iloc[0]) if not df_funil["dias_mes"].dropna().empty else 0
 dia_atual = numero(df_funil["dia_atual"].dropna().iloc[0]) if not df_funil["dia_atual"].dropna().empty else 0
@@ -649,9 +923,14 @@ with k4:
 with k5:
     card_kpi("Atingimento de vendas", fmt_pct(ating_vendas), "Atual / esperado")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Visão Executiva", "Ranking de Operações", "Funil Consolidado", "Diagnóstico", "Performance Financeira"]
+
+# =========================
+# TABS
+# =========================
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Visão Executiva", "Ranking de Operações", "Funil Consolidado", "Diagnóstico", "Performance Financeira", "Roleta"]
 )
+
 
 with tab1:
     st.markdown("<div class='section-title'>Comparativo executivo do consolidado</div>", unsafe_allow_html=True)
@@ -694,6 +973,7 @@ with tab1:
         )
         fig_funil.update_layout(title="Funil real do consolidado")
         st.plotly_chart(estilizar_fig(fig_funil), use_container_width=True)
+
 
 with tab2:
     st.markdown("<div class='section-title'>Ranking por operação</div>", unsafe_allow_html=True)
@@ -818,6 +1098,7 @@ with tab2:
                 height=260,
             )
 
+
 with tab3:
     st.markdown("<div class='section-title'>Meta total, esperado e realizado</div>", unsafe_allow_html=True)
     fig_full = go.Figure()
@@ -850,6 +1131,7 @@ with tab3:
         use_container_width=True,
         height=300,
     )
+
 
 with tab4:
     st.markdown("<div class='section-title'>Leitura executiva dos gargalos</div>", unsafe_allow_html=True)
@@ -884,5 +1166,10 @@ with tab4:
             unsafe_allow_html=True,
         )
 
+
 with tab5:
     render_financeiro()
+
+
+with tab6:
+    render_roleta()
